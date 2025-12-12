@@ -47,6 +47,7 @@ main.py             # Entry point
 ### Prerequisites
 
 - Python 3.12+
+- [uv](https://docs.astral.sh/uv/) - Fast Python package installer
 - Telegram Bot Token (from [@BotFather](https://t.me/botfather))
 
 ### Setup
@@ -56,11 +57,14 @@ main.py             # Entry point
 git clone <repo-url>
 cd save-media-from-threads-telegram-bot
 
-# Install dependencies
-pip install -e .
+# Install uv (if not already installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Install dependencies with uv
+uv sync
 
 # Install Playwright browsers
-playwright install chromium
+uv run playwright install chromium
 
 # Configure environment
 cp .env.example .env
@@ -82,7 +86,7 @@ BROWSER_TIMEOUT=30000          # Optional, defaults to 30s
 ### Start the bot
 
 ```bash
-python main.py
+uv run python main.py
 ```
 
 ### In Telegram
@@ -235,10 +239,6 @@ pytest
 - [ ] Store post metadata in database
 - [ ] Add admin commands for cache management
 - [ ] Implement webhook mode (alternative to polling)
-
-## License
-
-MIT
 
 ## Credits
 
