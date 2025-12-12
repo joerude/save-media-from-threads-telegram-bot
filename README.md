@@ -108,18 +108,6 @@ https://www.threads.com/@alvinfoo/post/DSJbc6ciVdv
 https://www.threads.com/@zuck/post/C8rOe_Hr4Sm
 ```
 
-## Testing Pydantic Integration
-
-```bash
-# Run validation tests
-python test_pydantic.py
-
-# Run unit tests
-pytest -v
-```
-
-See `PYDANTIC_GUIDE.md` for detailed documentation on data validation.
-
 ## Telegram Limits
 
 The bot respects Telegram API limits:
