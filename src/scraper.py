@@ -1,20 +1,19 @@
 """Threads content scraper using Playwright."""
 
 import asyncio
-import json
+import base64
 import logging
+import urllib.parse
 from typing import Optional
-from bs4 import BeautifulSoup
 
+from bs4 import BeautifulSoup
 from playwright.async_api import (
-    async_playwright,
     Browser,
     Page,
-    TimeoutError as PlaywrightTimeout,
+    async_playwright,
 )
 
-from .config import BROWSER_TIMEOUT, MAX_RETRIES
-from .models import ThreadsPost, MediaItem, MediaType
+from .models import MediaItem, MediaType, ThreadsPost
 from .url_parser import ThreadsURL
 
 logger = logging.getLogger(__name__)
@@ -131,15 +130,17 @@ class ThreadsScraper:
                 }
             )
 
-            # Navigate to post - use domcontentloaded for faster response
             logger.info(f"Loading {threads_url.full_url}")
 
             response = await page.goto(
                 threads_url.full_url,
-                wait_until="networkidle",  # Wait for network to settle for media
-                timeout=30000,  # 30 seconds is plenty
+                wait_until="domcontentloaded",
+                timeout=30000,
             )
             logger.info(f"Page loaded with status: {response.status if response else 'unknown'}")
+
+            # Wait for js  render content
+            await asyncio.sleep(3)
 
             # Check page title early for debugging
             early_title = await page.title()
@@ -151,6 +152,15 @@ class ThreadsScraper:
                 await asyncio.sleep(5)
                 early_title = await page.title()
                 logger.debug(f"After wait, title: {early_title[:100]}")
+
+                # If still showing login wall after wait, post might be private
+                if "join threads" in early_title.lower() or "log in" in early_title.lower():
+                    logger.error(
+                        "❌ Still showing login wall - post may be private or require authentication"
+                    )
+                    raise PostNotFoundError(
+                        f"Post {threads_url.post_id} is private or requires authentication"
+                    )
 
             # Check if post exists
             if await self._is_post_unavailable(page):
@@ -281,7 +291,13 @@ class ThreadsScraper:
         meta_og = await page.query_selector('meta[property="og:description"]')
         if meta_og:
             text = await meta_og.get_attribute("content")
-            if text and len(text) > 15:
+            # Filter out login prompts
+            if text and (
+                "join threads" in text.lower() or "log in with your instagram" in text.lower()
+            ):
+                logger.warning("⚠️ og:description contains login prompt, skipping")
+                text = None
+            elif text and len(text) > 15:
                 logger.info(f"✅ Extracted text from og:description ({len(text)} chars)")
 
         # Strategy 2: Page title - most reliable fallback
@@ -289,8 +305,10 @@ class ThreadsScraper:
             title = await page.title()
             logger.debug(f"Page title: {title[:100] if title else 'None'}...")
 
-            # Clean up title - remove "Threads" branding
-            if title and len(title) > 20:
+            # Skip login prompts in title
+            if title and ("join threads" in title.lower() or "log in" in title.lower()):
+                logger.warning("⚠️ Page title contains login prompt, skipping")
+            elif title and len(title) > 20:
                 # Remove common suffixes
                 cleaned = title.replace(" | Threads", "").replace(" - Threads", "").strip()
                 if len(cleaned) > 15:  # Still has meaningful content
@@ -302,21 +320,35 @@ class ThreadsScraper:
             meta_desc = await page.query_selector('meta[name="description"]')
             if meta_desc:
                 text = await meta_desc.get_attribute("content")
-                if text:
+                # Filter out login prompts
+                if text and ("join threads" in text.lower() or "log in" in text.lower()):
+                    logger.warning("⚠️ Meta description contains login prompt, skipping")
+                    text = None
+                elif text:
                     logger.info(f"✅ Extracted text from meta description ({len(text)} chars)")
 
-        # Strategy 4: Try basic body text
-        if not text:
-            text = await self._extract_text_from_dom(page)
-            if text:
-                logger.info(f"✅ Extracted text from DOM ({len(text)} chars)")
+        # DO NOT extract from DOM - Threads loads multiple posts in feed
+        # DOM extraction would grab content from wrong posts
 
         if not text:
-            logger.warning("⚠️ No text content found")
+            logger.warning("⚠️ No text content found in OpenGraph tags")
             text = ""
 
         # Extract media (videos first, then images)
         media_items, media_type = await self._extract_media(page)
+
+        # If no text AND no media AND generic logo, it's likely a login wall
+        if not text and not media_items:
+            meta_og_img = await page.query_selector('meta[property="og:image"]')
+            if meta_og_img:
+                img_url = await meta_og_img.get_attribute("content")
+                if img_url and "rsrc.php" in img_url:  # Threads default logo
+                    logger.error(
+                        "❌ Post appears to be private or requires authentication (no content found)"
+                    )
+                    raise PostNotFoundError(
+                        f"Post {threads_url.post_id} is private or requires authentication"
+                    )
 
         return ThreadsPost(
             post_id=threads_url.post_id,
@@ -366,13 +398,13 @@ class ThreadsScraper:
         """
         Extract media (videos and images) from post.
 
-        Strategy - ONLY use OpenGraph meta tags (post-specific):
-        1. og:video or og:video:secure_url for videos
-        2. og:image for images
+        Strategy:
+        1. og:video or og:video:secure_url for videos (most reliable)
+        2. If og:image looks like video thumbnail → try DOM extraction
+        3. og:image for regular images
 
-        We avoid scanning <video>/<img> tags because Threads loads multiple posts
-        in the feed and we'd grab media from wrong posts. OpenGraph tags are
-        specific to the requested post URL.
+        We prefer OpenGraph tags but fall back to DOM extraction for videos
+        when og:video is missing but og:image indicates it's a video post.
         """
         media_items = []
 
@@ -385,7 +417,7 @@ class ThreadsScraper:
         if og_video:
             video_url = og_video.get("content", "")
             if video_url and self._is_valid_video_url(video_url):
-                logger.info(f"✅ Found video from og:video")
+                logger.info("✅ Found video from og:video")
                 logger.info(f"   URL: {video_url}")
                 media_items.append(MediaItem(url=video_url, type=MediaType.VIDEO))
                 return media_items, MediaType.VIDEO
@@ -395,25 +427,182 @@ class ThreadsScraper:
         if og_video_secure:
             video_url = og_video_secure.get("content", "")
             if video_url and self._is_valid_video_url(video_url):
-                logger.info(f"✅ Found video from og:video:secure_url")
+                logger.info("✅ Found video from og:video:secure_url")
                 logger.info(f"   URL: {video_url}")
                 media_items.append(MediaItem(url=video_url, type=MediaType.VIDEO))
                 return media_items, MediaType.VIDEO
 
-        # Priority 2: Check for image (only if no video)
+        # Priority 2: Check if og:image is actually a video thumbnail or try DOM extraction
         og_image = soup.find("meta", property="og:image")
-        if og_image:
-            image_url = og_image.get("content", "")
-            if image_url and self._is_valid_image_url(image_url):
-                logger.info(f"✅ Found image from og:image")
-                logger.info(f"   URL: {image_url}")
-                media_items.append(MediaItem(url=image_url, type=MediaType.IMAGE))
-                return media_items, MediaType.IMAGE
+        image_url = og_image.get("content", "") if og_image else ""
+
+        # Check if this looks like a video thumbnail (has cover_frame in URL)
+        is_video_thumbnail = image_url and (
+            "cover_frame" in image_url or "default_cover" in image_url
+        )
+
+        # Also check if og:image is a profile picture (indicates might be video post)
+        is_profile_pic = image_url and "t51.2885-19" in image_url
+
+        logger.debug(
+            f"Video detection - is_video_thumbnail: {is_video_thumbnail}, is_profile_pic: {is_profile_pic}, image_url[:80]: {image_url[:80] if image_url else 'None'}"
+        )
+
+        # Try DOM video extraction if:
+        # 1. og:image looks like video thumbnail, OR
+        # 2. og:image is profile picture (text-only posts with videos), OR
+        # 3. No valid og:image at all
+        should_try_dom_video = (
+            is_video_thumbnail or is_profile_pic or not self._is_valid_image_url(image_url)
+        )
+
+        logger.debug(f"should_try_dom_video: {should_try_dom_video}")
+
+        if should_try_dom_video:
+            if is_video_thumbnail:
+                logger.info("🎬 og:image appears to be video thumbnail, trying DOM extraction...")
+            elif is_profile_pic:
+                logger.info("🎬 og:image is profile picture, checking for video in DOM...")
+            else:
+                logger.info("🎬 No valid og:image, checking for video in DOM...")
+
+            video_url = await self._extract_video_from_dom(page)
+            if video_url:
+                logger.info("✅ Found video from DOM extraction")
+                logger.info(f"   URL: {video_url}")
+                media_items.append(MediaItem(url=video_url, type=MediaType.VIDEO))
+                return media_items, MediaType.VIDEO
+
+        # Priority 3: Regular image (if valid and not a video post)
+        if image_url and self._is_valid_image_url(image_url):
+            logger.info("✅ Found image from og:image")
+            logger.info(f"   URL: {image_url}")
+            media_items.append(MediaItem(url=image_url, type=MediaType.IMAGE))
+
+            # Check if this is a carousel post (multiple images)
+            carousel_images = await self._extract_carousel_images(
+                page, soup, first_image_url=image_url
+            )
+            if carousel_images:
+                logger.info(f"📸 Found {len(carousel_images)} additional carousel images")
+                media_items.extend(carousel_images)
+
+            return media_items, MediaType.IMAGE
 
         logger.warning(
             "⚠️ No og:video or og:image found - post may have carousel or unsupported media"
         )
         return [], MediaType.TEXT_ONLY
+
+    async def _extract_video_from_dom(self, page: Page) -> Optional[str]:
+        """
+        Extract video URL from first <video> element in DOM.
+
+        This is used as fallback when og:video is missing but post appears to be a video.
+        We take the first video element assuming it's most likely the target post.
+        """
+        try:
+            # Try to find first video element
+            video_element = await page.query_selector("video")
+            if not video_element:
+                logger.debug("No <video> element found in DOM")
+                return None
+
+            # Try various attributes where video URL might be stored
+            for attr in ["src", "data-src", "data-video-url"]:
+                video_src = await video_element.get_attribute(attr)
+                if video_src:
+                    # Skip blob URLs (temporary browser URLs)
+                    if video_src.startswith("blob:"):
+                        logger.debug(f"Skipping blob URL: {video_src[:50]}...")
+                        continue
+
+                    if self._is_valid_video_url(video_src):
+                        logger.debug(f"Found video {attr}: {video_src}")
+                        return video_src
+
+            # Try to find <source> child elements
+            source_elements = await video_element.query_selector_all("source")
+            for source in source_elements:
+                for attr in ["src", "data-src"]:
+                    src = await source.get_attribute(attr)
+                    if src and not src.startswith("blob:") and self._is_valid_video_url(src):
+                        logger.debug(f"Found video source {attr}: {src}")
+                        return src
+
+            logger.debug("Video element found but no valid video URL")
+            return None
+
+        except Exception as e:
+            logger.warning(f"Error extracting video from DOM: {e}")
+            return None
+
+    async def _extract_carousel_images(
+        self, page: Page, soup: BeautifulSoup, first_image_url: str
+    ) -> list[MediaItem]:
+        """
+        Extract additional images from carousel posts.
+
+        Carousel images have 'CAROUSEL_ITEM' in their URL (sometimes encoded in 'efg' param),
+        which makes them safe to extract.
+
+        Args:
+            page: Playwright page object
+            soup: BeautifulSoup parsed HTML
+            first_image_url: URL of the first image (from og:image) to skip
+        """
+        carousel_items = []
+
+        try:
+            # Find all img tags
+            all_imgs = soup.find_all("img")
+
+            for img in all_imgs:
+                src = img.get("src", "")
+                if not src:
+                    continue
+
+                # Skip the first image (already added from og:image)
+                if src == first_image_url:
+                    continue
+
+                if not self._is_valid_image_url(src):
+                    continue
+
+                # Check if this is a carousel item
+                is_carousel = False
+
+                # 1. Direct check
+                if "CAROUSEL_ITEM" in src:
+                    is_carousel = True
+
+                # 2. Check encoded efg parameter
+                elif "efg=" in src:
+                    try:
+                        parsed = urllib.parse.urlparse(src)
+                        params = urllib.parse.parse_qs(parsed.query)
+                        if "efg" in params:
+                            efg_encoded = params["efg"][0]
+                            # Add padding if needed
+                            efg_encoded += "=" * (-len(efg_encoded) % 4)
+                            # URL safe decode
+                            efg_decoded = base64.urlsafe_b64decode(efg_encoded).decode("utf-8")
+                            if "CAROUSEL_ITEM" in efg_decoded:
+                                is_carousel = True
+                    except Exception:
+                        pass
+
+                if is_carousel:
+                    # Avoid duplicates
+                    if not any(item.url == src for item in carousel_items):
+                        carousel_items.append(MediaItem(url=src, type=MediaType.IMAGE))
+                        logger.debug(f"Found carousel image: {src[:80]}...")
+
+            return carousel_items
+
+        except Exception as e:
+            logger.warning(f"Error extracting carousel images: {e}")
+            return []
 
     def _is_valid_image_url(self, url: str) -> bool:
         """Check if URL looks like a valid image."""
@@ -424,9 +613,21 @@ class ThreadsScraper:
         if "instagram" not in url.lower() and "fbcdn" not in url.lower():
             return False
 
-        # Filter out profile pictures and small images
-        exclude_patterns = ["profile", "avatar", "44x44", "150x150"]
+        # Filter out Threads generic logo (indicates login wall or private post)
+        if "rsrc.php" in url:
+            logger.debug(f"Rejecting generic Threads logo: {url[:80]}...")
+            return False
+
+        # Filter out profile pictures - Instagram uses t51.2885-19 for profile pics
+        # The -19 suffix specifically indicates profile picture resources
+        if "t51.2885-19" in url:
+            logger.debug(f"Rejecting profile picture: {url[:80]}...")
+            return False
+
+        # Filter out small thumbnail sizes commonly used for avatars
+        exclude_patterns = ["profile", "avatar", "44x44", "150x150", "s150x150"]
         if any(pattern in url.lower() for pattern in exclude_patterns):
+            logger.debug(f"Rejecting image with excluded pattern: {url[:80]}...")
             return False
 
         return True
@@ -440,8 +641,12 @@ class ThreadsScraper:
         if "instagram" not in url.lower() and "fbcdn" not in url.lower():
             return False
 
-        # Videos often have .mp4 extension or video in path
-        if ".mp4" in url.lower() or "video" in url.lower():
+        # Instagram video URLs often have patterns like:
+        # - /o1/v/ or /o1/v/t16/ or /o1/v/t2/ (video content)
+        # - .mp4 extension
+        # - "video" in path
+        video_indicators = ["/o1/v/", "/v/t16/", "/v/t2/", ".mp4", "video"]
+        if any(indicator in url.lower() for indicator in video_indicators):
             return True
 
-        return True  # If from CDN, likely valid
+        return False  # Be strict - only accept clear video URLs
