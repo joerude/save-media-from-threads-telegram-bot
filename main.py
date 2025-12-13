@@ -2,6 +2,7 @@
 
 import logging
 import sys
+
 from dotenv import load_dotenv
 
 # Load environment variables

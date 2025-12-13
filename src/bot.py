@@ -1,24 +1,23 @@
 """Telegram bot handlers and delivery logic."""
 
 import logging
-from pathlib import Path
 from typing import Optional
 
-from telegram import Update, InputMediaPhoto, InputMediaVideo
+from telegram import InputMediaPhoto, Update
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
-    MessageHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
-from telegram.error import TelegramError
 
 from .config import TELEGRAM_BOT_TOKEN, TELEGRAM_MAX_MEDIA_GROUP
-from .models import ThreadsPost, MediaType
+from .downloader import DownloadError, MediaDownloader
+from .models import MediaType, ThreadsPost
+from .scraper import ExtractionError, PostNotFoundError, ThreadsScraper
 from .url_parser import ThreadsURLParser, URLParserError
-from .scraper import ThreadsScraper, PostNotFoundError, ExtractionError
-from .downloader import MediaDownloader, DownloadError
 
 logger = logging.getLogger(__name__)
 

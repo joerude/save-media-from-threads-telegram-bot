@@ -3,9 +3,9 @@
 import hashlib
 import logging
 from pathlib import Path
-from typing import Optional
-import aiohttp
+
 import aiofiles
+import aiohttp
 
 from .config import CACHE_DIR, TELEGRAM_MAX_FILE_SIZE
 from .models import MediaItem
