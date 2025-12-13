@@ -134,10 +134,11 @@ class ThreadsScraper:
             )
 
             # Block unnecessary resources to speed up loading
+            # Note: We don't block 'media' because it might be needed for video elements to initialize properly
             await page.route(
                 "**/*",
                 lambda route: route.abort()
-                if route.request.resource_type in ["image", "media", "font", "stylesheet", "other"]
+                if route.request.resource_type in ["image", "font", "stylesheet", "other"]
                 else route.continue_(),
             )
 
@@ -451,10 +452,25 @@ class ThreadsScraper:
         og_image = soup.find("meta", property="og:image")
         image_url = og_image.get("content", "") if og_image else ""
 
-        # Check if this looks like a video thumbnail (has cover_frame in URL)
-        is_video_thumbnail = image_url and (
-            "cover_frame" in image_url or "default_cover" in image_url
-        )
+        # Check if this looks like a video thumbnail
+        is_video_thumbnail = False
+        if image_url:
+            # 1. Direct check in URL
+            if "cover_frame" in image_url or "default_cover" in image_url:
+                is_video_thumbnail = True
+            # 2. Check encoded efg parameter
+            elif "efg=" in image_url:
+                try:
+                    parsed = urllib.parse.urlparse(image_url)
+                    params = urllib.parse.parse_qs(parsed.query)
+                    if "efg" in params:
+                        efg_encoded = params["efg"][0]
+                        efg_encoded += "=" * (-len(efg_encoded) % 4)
+                        efg_decoded = base64.urlsafe_b64decode(efg_encoded).decode("utf-8")
+                        if "cover_frame" in efg_decoded or "default_cover" in efg_decoded:
+                            is_video_thumbnail = True
+                except Exception:
+                    pass
 
         # Also check if og:image is a profile picture (indicates might be video post)
         is_profile_pic = image_url and "t51.2885-19" in image_url
