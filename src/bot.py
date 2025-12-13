@@ -4,6 +4,7 @@ import logging
 from typing import Optional
 
 from telegram import InputMediaPhoto, Update
+from telegram.constants import ChatAction
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
@@ -82,45 +83,53 @@ class TelegramBot:
             await update.message.reply_text(
                 "❌ Invalid URL. Please send a valid Threads post URL.\n\n"
                 "Example:\n"
-                "https://www.threads.com/@username/post/POST_ID"
+                "https://www.threads.com/@username/post/POST_ID",
+                reply_to_message_id=update.message.message_id,
             )
             return
 
-        # Process post
-        status_msg = await update.message.reply_text("⏳ Extracting content...")
+        # Send initial status action
+        await update.message.chat.send_action(action=ChatAction.TYPING)
 
         try:
             # Scrape post
             post = await self.scraper.scrape_post(threads_url)
-            await status_msg.edit_text("📥 Downloading media...")
 
             # Download media if present
             if post.has_media:
+                await update.message.chat.send_action(
+                    action=ChatAction.UPLOAD_PHOTO if post.has_images else ChatAction.UPLOAD_VIDEO
+                )
                 await self.downloader.download_all(post.media_items, post.post_id)
 
             # Send to user
-            await status_msg.edit_text("📤 Sending...")
             await self.send_post(update, post)
-
-            # Delete status message
-            await status_msg.delete()
 
             # Cleanup cache after sending
             self.downloader.cleanup_post_cache(post.post_id)
 
         except PostNotFoundError:
-            await status_msg.edit_text(
-                "❌ Post not found or is private.\n\nMake sure the post exists and is public."
+            await update.message.reply_text(
+                "❌ Post not found or is private.\n\nMake sure the post exists and is public.",
+                reply_to_message_id=update.message.message_id,
             )
         except ExtractionError as e:
-            await status_msg.edit_text(f"❌ Failed to extract content: {e}")
+            await update.message.reply_text(
+                f"❌ Failed to extract content: {e}", reply_to_message_id=update.message.message_id
+            )
         except DownloadError as e:
-            await status_msg.edit_text(f"❌ Failed to download media: {e}")
+            await update.message.reply_text(
+                f"❌ Failed to download media: {e}", reply_to_message_id=update.message.message_id
+            )
         except TelegramError as e:
-            await status_msg.edit_text(f"❌ Failed to send content: {e}")
+            await update.message.reply_text(
+                f"❌ Failed to send content: {e}", reply_to_message_id=update.message.message_id
+            )
         except Exception as e:
             logger.exception("Unexpected error")
-            await status_msg.edit_text(f"❌ Unexpected error: {e}")
+            await update.message.reply_text(
+                f"❌ Unexpected error: {e}", reply_to_message_id=update.message.message_id
+            )
 
     async def send_post(self, update: Update, post: ThreadsPost):
         """
@@ -148,16 +157,23 @@ class TelegramBot:
         # Text only
         else:
             if caption:
-                await update.message.reply_text(caption)
+                await update.message.reply_text(
+                    caption, reply_to_message_id=update.message.message_id
+                )
             else:
-                await update.message.reply_text("✅ Post has no text or media content.")
+                await update.message.reply_text(
+                    "✅ Post has no text or media content.",
+                    reply_to_message_id=update.message.message_id,
+                )
 
     async def _send_video(self, update: Update, post: ThreadsPost, caption: Optional[str]):
         """Send video to user."""
         video_item = next(item for item in post.media_items if item.type == MediaType.VIDEO)
 
         if not video_item.local_path:
-            await update.message.reply_text("❌ Video not downloaded")
+            await update.message.reply_text(
+                "❌ Video not downloaded", reply_to_message_id=update.message.message_id
+            )
             return
 
         try:
@@ -166,13 +182,16 @@ class TelegramBot:
                     video=video_file,
                     caption=caption[:1024] if caption else None,  # Telegram caption limit
                     supports_streaming=True,
+                    reply_to_message_id=update.message.message_id,
                 )
         except TelegramError as e:
             logger.error(f"Failed to send video: {e}")
             # Fallback: send as document
             with open(video_item.local_path, "rb") as video_file:
                 await update.message.reply_document(
-                    document=video_file, caption=caption[:1024] if caption else None
+                    document=video_file,
+                    caption=caption[:1024] if caption else None,
+                    reply_to_message_id=update.message.message_id,
                 )
 
     async def _send_single_image(self, update: Update, post: ThreadsPost, caption: Optional[str]):
@@ -180,12 +199,16 @@ class TelegramBot:
         image_item = post.media_items[0]
 
         if not image_item.local_path:
-            await update.message.reply_text("❌ Image not downloaded")
+            await update.message.reply_text(
+                "❌ Image not downloaded", reply_to_message_id=update.message.message_id
+            )
             return
 
         with open(image_item.local_path, "rb") as image_file:
             await update.message.reply_photo(
-                photo=image_file, caption=caption[:1024] if caption else None
+                photo=image_file,
+                caption=caption[:1024] if caption else None,
+                reply_to_message_id=update.message.message_id,
             )
 
     async def _send_image_carousel(self, update: Update, post: ThreadsPost, caption: Optional[str]):
@@ -194,7 +217,9 @@ class TelegramBot:
         items = post.media_items[:TELEGRAM_MAX_MEDIA_GROUP]
 
         if not all(item.local_path for item in items):
-            await update.message.reply_text("❌ Some images were not downloaded")
+            await update.message.reply_text(
+                "❌ Some images were not downloaded", reply_to_message_id=update.message.message_id
+            )
             return
 
         # Build media group
@@ -205,11 +230,15 @@ class TelegramBot:
                 item_caption = caption[:1024] if i == 0 and caption else None
                 media_group.append(InputMediaPhoto(media=image_file.read(), caption=item_caption))
 
-        await update.message.reply_media_group(media=media_group)
+        await update.message.reply_media_group(
+            media=media_group, reply_to_message_id=update.message.message_id
+        )
 
         # If text is too long, send separately
         if caption and len(caption) > 1024:
-            await update.message.reply_text(f"Full text:\n\n{caption}")
+            await update.message.reply_text(
+                f"Full text:\n\n{caption}", reply_to_message_id=update.message.message_id
+            )
 
     async def startup(self, application: Application):
         """Initialize resources on startup."""

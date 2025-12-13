@@ -12,6 +12,9 @@ from playwright.async_api import (
     Page,
     async_playwright,
 )
+from playwright.async_api import (
+    TimeoutError as PlaywrightTimeout,
+)
 
 from .models import MediaItem, MediaType, ThreadsPost
 from .url_parser import ThreadsURL
@@ -130,6 +133,14 @@ class ThreadsScraper:
                 }
             )
 
+            # Block unnecessary resources to speed up loading
+            await page.route(
+                "**/*",
+                lambda route: route.abort()
+                if route.request.resource_type in ["image", "media", "font", "stylesheet", "other"]
+                else route.continue_(),
+            )
+
             logger.info(f"Loading {threads_url.full_url}")
 
             response = await page.goto(
@@ -139,8 +150,12 @@ class ThreadsScraper:
             )
             logger.info(f"Page loaded with status: {response.status if response else 'unknown'}")
 
-            # Wait for js  render content
-            await asyncio.sleep(3)
+            # Wait for essential content to load instead of fixed sleep
+            try:
+                # Wait for either og:description or any image to appear
+                await page.wait_for_selector('meta[property="og:description"], img', timeout=5000)
+            except PlaywrightTimeout:
+                logger.warning("Timeout waiting for meta tags or images, proceeding anyway")
 
             # Check page title early for debugging
             early_title = await page.title()
